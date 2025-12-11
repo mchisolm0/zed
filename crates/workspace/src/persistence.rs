@@ -11,12 +11,14 @@ use std::{
 use anyhow::{Context as _, Result, bail};
 use collections::{HashMap, IndexSet};
 use db::{
+    kvp::KEY_VALUE_STORE,
     query,
     sqlez::{connection::Connection, domain::Domain},
     sqlez_macros::sql,
 };
 use gpui::{Axis, Bounds, Task, WindowBounds, WindowId, point, size};
 use project::debugger::breakpoint_store::{BreakpointState, SourceBreakpoint};
+use serde::{Deserialize, Serialize};
 
 use language::{LanguageName, Toolchain, ToolchainScope};
 use project::WorktreeId;
@@ -245,6 +247,89 @@ impl Column for Breakpoint {
 #[derive(Clone, Debug, PartialEq)]
 struct SerializedPixels(gpui::Pixels);
 impl sqlez::bindable::StaticColumnCount for SerializedPixels {}
+
+const DEFAULT_WINDOW_BOUNDS_KEY: &str = "default_window_bounds";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SerializedDefaultWindowBounds {
+    pub window_state: String,
+    pub x: i32,
+    pub y: i32,
+    pub width: i32,
+    pub height: i32,
+    pub display_uuid: Option<String>,
+}
+
+impl SerializedDefaultWindowBounds {
+    pub fn from_bounds(bounds: SerializedWindowBounds, display_uuid: Uuid) -> Self {
+        let (window_state, x, y, width, height) = match bounds.0 {
+            WindowBounds::Windowed(b) => (
+                "Windowed".to_string(),
+                u32::from(b.origin.x) as i32,
+                u32::from(b.origin.y) as i32,
+                u32::from(b.size.width) as i32,
+                u32::from(b.size.height) as i32,
+            ),
+            WindowBounds::Maximized(b) => (
+                "Maximized".to_string(),
+                u32::from(b.origin.x) as i32,
+                u32::from(b.origin.y) as i32,
+                u32::from(b.size.width) as i32,
+                u32::from(b.size.height) as i32,
+            ),
+            WindowBounds::Fullscreen(b) => (
+                "FullScreen".to_string(),
+                u32::from(b.origin.x) as i32,
+                u32::from(b.origin.y) as i32,
+                u32::from(b.size.width) as i32,
+                u32::from(b.size.height) as i32,
+            ),
+        };
+        Self {
+            window_state,
+            x,
+            y,
+            width,
+            height,
+            display_uuid: Some(display_uuid.to_string()),
+        }
+    }
+
+    pub fn to_bounds(&self) -> Option<(Uuid, SerializedWindowBounds)> {
+        let display_uuid = self.display_uuid.as_ref()?.parse().ok()?;
+        let bounds = Bounds {
+            origin: point(px(self.x as f32), px(self.y as f32)),
+            size: size(px(self.width as f32), px(self.height as f32)),
+        };
+        let window_bounds = match self.window_state.as_str() {
+            "Windowed" => WindowBounds::Windowed(bounds),
+            "Maximized" => WindowBounds::Maximized(bounds),
+            "FullScreen" => WindowBounds::Fullscreen(bounds),
+            _ => return None,
+        };
+        Some((display_uuid, SerializedWindowBounds(window_bounds)))
+    }
+}
+
+pub fn read_default_window_bounds() -> Option<(Uuid, SerializedWindowBounds)> {
+    let json_str = KEY_VALUE_STORE
+        .read_kvp(DEFAULT_WINDOW_BOUNDS_KEY)
+        .log_err()
+        .flatten()?;
+    let serialized: SerializedDefaultWindowBounds = serde_json::from_str(&json_str).log_err()?;
+    serialized.to_bounds()
+}
+
+pub async fn write_default_window_bounds(
+    bounds: SerializedWindowBounds,
+    display_uuid: Uuid,
+) -> anyhow::Result<()> {
+    let serialized = SerializedDefaultWindowBounds::from_bounds(bounds, display_uuid);
+    let json_str = serde_json::to_string(&serialized)?;
+    KEY_VALUE_STORE
+        .write_kvp(DEFAULT_WINDOW_BOUNDS_KEY.to_string(), json_str)
+        .await
+}
 
 impl sqlez::bindable::Bind for SerializedPixels {
     fn bind(
@@ -2981,5 +3066,173 @@ mod tests {
         let new_workspace = db.workspace_for_roots(id).unwrap();
 
         assert_eq!(workspace.center_group, new_workspace.center_group);
+    }
+
+    #[gpui::test]
+    async fn test_serialized_default_window_bounds_roundtrip() {
+        let bounds = SerializedWindowBounds(WindowBounds::Windowed(Bounds {
+            origin: point(px(100.0), px(200.0)),
+            size: size(px(1200.0), px(800.0)),
+        }));
+        let display_uuid = Uuid::new_v4();
+
+        let serialized = SerializedDefaultWindowBounds::from_bounds(bounds, display_uuid);
+
+        assert_eq!(serialized.window_state, "Windowed");
+        assert_eq!(serialized.x, 100);
+        assert_eq!(serialized.y, 200);
+        assert_eq!(serialized.width, 1200);
+        assert_eq!(serialized.height, 800);
+        assert_eq!(serialized.display_uuid, Some(display_uuid.to_string()));
+
+        let (restored_uuid, restored_bounds) = serialized.to_bounds().unwrap();
+        assert_eq!(restored_uuid, display_uuid);
+        assert_eq!(restored_bounds, bounds);
+    }
+
+    #[gpui::test]
+    async fn test_serialized_default_window_bounds_maximized() {
+        let bounds = SerializedWindowBounds(WindowBounds::Maximized(Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(1920.0), px(1080.0)),
+        }));
+        let display_uuid = Uuid::new_v4();
+
+        let serialized = SerializedDefaultWindowBounds::from_bounds(bounds, display_uuid);
+        assert_eq!(serialized.window_state, "Maximized");
+
+        let (_, restored_bounds) = serialized.to_bounds().unwrap();
+        assert_eq!(restored_bounds, bounds);
+    }
+
+    #[gpui::test]
+    async fn test_serialized_default_window_bounds_fullscreen() {
+        let bounds = SerializedWindowBounds(WindowBounds::Fullscreen(Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(2560.0), px(1440.0)),
+        }));
+        let display_uuid = Uuid::new_v4();
+
+        let serialized = SerializedDefaultWindowBounds::from_bounds(bounds, display_uuid);
+        assert_eq!(serialized.window_state, "FullScreen");
+
+        let (_, restored_bounds) = serialized.to_bounds().unwrap();
+        assert_eq!(restored_bounds, bounds);
+    }
+
+    #[gpui::test]
+    async fn test_serialized_default_window_bounds_json_roundtrip() {
+        let bounds = SerializedWindowBounds(WindowBounds::Windowed(Bounds {
+            origin: point(px(50.0), px(75.0)),
+            size: size(px(800.0), px(600.0)),
+        }));
+        let display_uuid = Uuid::new_v4();
+
+        let serialized = SerializedDefaultWindowBounds::from_bounds(bounds, display_uuid);
+        let json_str = serde_json::to_string(&serialized).unwrap();
+        let deserialized: SerializedDefaultWindowBounds = serde_json::from_str(&json_str).unwrap();
+
+        let (restored_uuid, restored_bounds) = deserialized.to_bounds().unwrap();
+        assert_eq!(restored_uuid, display_uuid);
+        assert_eq!(restored_bounds, bounds);
+    }
+
+    #[gpui::test]
+    async fn test_serialized_default_window_bounds_missing_display_uuid() {
+        let serialized = SerializedDefaultWindowBounds {
+            window_state: "Windowed".to_string(),
+            x: 100,
+            y: 100,
+            width: 800,
+            height: 600,
+            display_uuid: None,
+        };
+
+        assert!(serialized.to_bounds().is_none());
+    }
+
+    #[gpui::test]
+    async fn test_serialized_default_window_bounds_invalid_window_state() {
+        let serialized = SerializedDefaultWindowBounds {
+            window_state: "InvalidState".to_string(),
+            x: 100,
+            y: 100,
+            width: 800,
+            height: 600,
+            display_uuid: Some(Uuid::new_v4().to_string()),
+        };
+
+        assert!(serialized.to_bounds().is_none());
+    }
+
+    #[gpui::test]
+    async fn test_default_window_bounds_kvp_write_and_read() {
+        use db::kvp::KeyValueStore;
+
+        let db = KeyValueStore::open_test_db("test_default_window_bounds_kvp").await;
+
+        let bounds = SerializedWindowBounds(WindowBounds::Windowed(Bounds {
+            origin: point(px(150.0), px(250.0)),
+            size: size(px(1000.0), px(700.0)),
+        }));
+        let display_uuid = Uuid::new_v4();
+
+        let serialized = SerializedDefaultWindowBounds::from_bounds(bounds, display_uuid);
+        let json_str = serde_json::to_string(&serialized).unwrap();
+
+        db.write_kvp(DEFAULT_WINDOW_BOUNDS_KEY.to_string(), json_str.clone())
+            .await
+            .unwrap();
+
+        let read_json = db.read_kvp(DEFAULT_WINDOW_BOUNDS_KEY).unwrap();
+        assert_eq!(read_json, Some(json_str));
+
+        let read_serialized: SerializedDefaultWindowBounds =
+            serde_json::from_str(&read_json.unwrap()).unwrap();
+        let (restored_uuid, restored_bounds) = read_serialized.to_bounds().unwrap();
+
+        assert_eq!(restored_uuid, display_uuid);
+        assert_eq!(restored_bounds, bounds);
+    }
+
+    #[gpui::test]
+    async fn test_default_window_bounds_kvp_overwrite() {
+        use db::kvp::KeyValueStore;
+
+        let db = KeyValueStore::open_test_db("test_default_window_bounds_kvp_overwrite").await;
+
+        let bounds1 = SerializedWindowBounds(WindowBounds::Windowed(Bounds {
+            origin: point(px(100.0), px(100.0)),
+            size: size(px(800.0), px(600.0)),
+        }));
+        let display_uuid1 = Uuid::new_v4();
+
+        let serialized1 = SerializedDefaultWindowBounds::from_bounds(bounds1, display_uuid1);
+        let json_str1 = serde_json::to_string(&serialized1).unwrap();
+
+        db.write_kvp(DEFAULT_WINDOW_BOUNDS_KEY.to_string(), json_str1)
+            .await
+            .unwrap();
+
+        let bounds2 = SerializedWindowBounds(WindowBounds::Maximized(Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(1920.0), px(1080.0)),
+        }));
+        let display_uuid2 = Uuid::new_v4();
+
+        let serialized2 = SerializedDefaultWindowBounds::from_bounds(bounds2, display_uuid2);
+        let json_str2 = serde_json::to_string(&serialized2).unwrap();
+
+        db.write_kvp(DEFAULT_WINDOW_BOUNDS_KEY.to_string(), json_str2)
+            .await
+            .unwrap();
+
+        let read_json = db.read_kvp(DEFAULT_WINDOW_BOUNDS_KEY).unwrap().unwrap();
+        let read_serialized: SerializedDefaultWindowBounds =
+            serde_json::from_str(&read_json).unwrap();
+        let (restored_uuid, restored_bounds) = read_serialized.to_bounds().unwrap();
+
+        assert_eq!(restored_uuid, display_uuid2);
+        assert_eq!(restored_bounds, bounds2);
     }
 }
