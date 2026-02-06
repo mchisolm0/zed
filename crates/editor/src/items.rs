@@ -1,7 +1,7 @@
 use crate::{
     Anchor, Autoscroll, BufferSerialization, Capability, Editor, EditorEvent, EditorSettings,
     ExcerptId, ExcerptRange, FormatTarget, MultiBuffer, MultiBufferSnapshot, NavigationData,
-    ReportEditorEvent, SearchWithinRange, SelectionEffects, ToPoint as _,
+    ReportEditorEvent, RewrapOptions, SearchWithinRange, SelectionEffects, ToPoint as _,
     display_map::HighlightKey,
     editor_settings::SeedQuerySetting,
     persistence::{DB, SerializedEditor},
@@ -12,7 +12,7 @@ use collections::{HashMap, HashSet};
 use file_icons::FileIcons;
 use fs::MTime;
 use futures::future::try_join_all;
-use git::status::GitSummary;
+use git::status::{COMMIT_MESSAGE, GitSummary};
 use gpui::{
     AnyElement, App, AsyncWindowContext, Context, Entity, EntityId, EventEmitter, IntoElement,
     ParentElement, Pixels, SharedString, Styled, Task, WeakEntity, Window, point,
@@ -860,6 +860,36 @@ impl Item for Editor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Task<Result<()>> {
+        // Add rewrap for commit messages initiated by `git commit` and `EDITOR` set to `zed -w`\
+        let should_rewrap_commit_message = !options.autosave
+            && self.buffer.read(cx).as_singleton().is_some_and(|buffer| {
+                buffer
+                    .read(cx)
+                    .file()
+                    .is_some_and(|file| file.file_name(cx) == COMMIT_MESSAGE)
+            });
+        if should_rewrap_commit_message {
+            let selection_anchors = {
+                let snapshot = self.buffer.read(cx).snapshot(cx);
+                self.selections
+                    .all_adjusted(&self.display_snapshot(cx))
+                    .into_iter()
+                    .map(|selection| selection.map(|point| snapshot.anchor_after(point)))
+                    .collect::<Vec<_>>()
+            };
+            self.select_all(&Default::default(), window, cx);
+            self.rewrap_impl(
+                RewrapOptions {
+                    override_language_settings: false,
+                    preserve_existing_whitespace: true,
+                },
+                cx,
+            );
+            self.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_anchors(selection_anchors);
+            });
+        }
+
         // Add meta data tracking # of auto saves
         if options.autosave {
             self.report_editor_event(ReportEditorEvent::Saved { auto_saved: true }, None, cx);
