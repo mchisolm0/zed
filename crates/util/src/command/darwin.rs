@@ -447,6 +447,12 @@ fn spawn_posix_spawn(
                 &mut file_actions,
                 libc::STDIN_FILENO,
             ))?;
+            if fd != libc::STDIN_FILENO {
+                cvt_nz(libc::posix_spawn_file_actions_addclose(
+                    &mut file_actions,
+                    fd,
+                ))?;
+            }
         }
 
         if let Some(fd) = stdout_write {
@@ -459,6 +465,12 @@ fn spawn_posix_spawn(
                 &mut file_actions,
                 libc::STDOUT_FILENO,
             ))?;
+            if fd != libc::STDOUT_FILENO {
+                cvt_nz(libc::posix_spawn_file_actions_addclose(
+                    &mut file_actions,
+                    fd,
+                ))?;
+            }
         }
 
         if let Some(fd) = stderr_write {
@@ -471,6 +483,12 @@ fn spawn_posix_spawn(
                 &mut file_actions,
                 libc::STDERR_FILENO,
             ))?;
+            if fd != libc::STDERR_FILENO {
+                cvt_nz(libc::posix_spawn_file_actions_addclose(
+                    &mut file_actions,
+                    fd,
+                ))?;
+            }
         }
 
         let mut pid: libc::pid_t = 0;
@@ -520,6 +538,13 @@ fn create_pipe() -> io::Result<(libc::c_int, libc::c_int)> {
     if result == -1 {
         return Err(io::Error::last_os_error());
     }
+    if let Err(error) = set_close_on_exec(fds[0]).and_then(|_| set_close_on_exec(fds[1])) {
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        return Err(error);
+    }
     Ok((fds[0], fds[1]))
 }
 
@@ -546,6 +571,18 @@ fn invalid_input_error() -> io::Error {
         io::ErrorKind::InvalidInput,
         "invalid argument: path or argument contains null byte",
     )
+}
+
+fn set_close_on_exec(fd: libc::c_int) -> io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[cfg(test)]
