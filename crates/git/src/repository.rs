@@ -698,7 +698,6 @@ pub trait GitRepository: Send + Sync {
     fn merge_message(&self) -> BoxFuture<'_, Option<String>>;
 
     fn status(&self, path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>>;
-    fn tracked_paths(&self) -> Task<Result<Vec<RepoPath>>>;
     fn diff_tree(&self, request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>>;
 
     fn stash_entries(&self) -> BoxFuture<'_, Result<GitStash>>;
@@ -958,7 +957,7 @@ impl RealGitRepository {
         let any_git_binary_path = system_git_binary_path
             .clone()
             .or(bundled_git_binary_path)
-            .unwrap_or_else(|| PathBuf::from("git"));
+            .context("no git binary available")?;
         log::info!(
             "opening git repository at {dotgit_path:?} using git binary {any_git_binary_path:?}"
         );
@@ -1518,31 +1517,6 @@ impl GitRepository for RealGitRepository {
             } else {
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 anyhow::bail!("git status failed: {stderr}");
-            }
-        })
-    }
-
-    fn tracked_paths(&self) -> Task<Result<Vec<RepoPath>>> {
-        let git = match self.git_binary() {
-            Ok(git) => git,
-            Err(e) => return Task::ready(Err(e)),
-        };
-        let args = git_tracked_paths_args();
-        self.executor.spawn(async move {
-            let output = git.build_command(&args).output().await?;
-            if output.status.success() {
-                output
-                    .stdout
-                    .split(|byte| *byte == b'\0')
-                    .filter(|path| !path.is_empty())
-                    .map(|path| {
-                        let path = std::str::from_utf8(path)?;
-                        RepoPath::new(path)
-                    })
-                    .collect()
-            } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                anyhow::bail!("git ls-files failed: {stderr}");
             }
         })
     }
@@ -2976,14 +2950,6 @@ fn git_status_args(path_prefixes: &[RepoPath]) -> Vec<OsString> {
         }
     }));
     args
-}
-
-fn git_tracked_paths_args() -> Vec<OsString> {
-    vec![
-        OsString::from("ls-files"),
-        OsString::from("-z"),
-        OsString::from("--cached"),
-    ]
 }
 
 /// Temporarily git-ignore commonly ignored files and files over 2MB
