@@ -22,7 +22,7 @@ use futures::{
 use fuzzy::CharBag;
 use git::{
     COMMIT_MESSAGE, DOT_GIT, FSMONITOR_DAEMON, GITIGNORE, INDEX_LOCK, LFS_DIR, REPO_EXCLUDE,
-    status::GitSummary,
+    repository::RepoPath, status::GitSummary,
 };
 use gpui::{
     App, AppContext as _, AsyncApp, BackgroundExecutor, Context, Entity, EventEmitter, Priority,
@@ -227,6 +227,34 @@ impl WorkDirectory {
             WorkDirectory::AboveProject { .. } => true,
         }
     }
+
+    fn tracked_files_prefixes(&self) -> Result<Vec<RepoPath>> {
+        match self {
+            WorkDirectory::InProject { .. } => Ok(Vec::new()),
+            WorkDirectory::AboveProject {
+                location_in_repo, ..
+            } => Ok(vec![RepoPath::from_std_path(
+                location_in_repo,
+                PathStyle::local(),
+            )?]),
+        }
+    }
+
+    fn worktree_path_for_repo_path(&self, repo_path: &RepoPath) -> Option<Arc<RelPath>> {
+        match self {
+            WorkDirectory::InProject { relative_path } => Some(relative_path.join(repo_path)),
+            WorkDirectory::AboveProject {
+                location_in_repo, ..
+            } => {
+                let relative_path = repo_path
+                    .as_std_path()
+                    .strip_prefix(location_in_repo)
+                    .ok()?;
+                let relative_path = RelPath::new(relative_path, PathStyle::local()).ok()?;
+                Some(Arc::from(relative_path.as_ref()))
+            }
+        }
+    }
 }
 
 impl Default for WorkDirectory {
@@ -281,6 +309,7 @@ struct LocalRepositoryEntry {
     work_directory_id: ProjectEntryId,
     work_directory: WorkDirectory,
     work_directory_abs_path: Arc<Path>,
+    tracked_path_overrides: Arc<HashSet<Arc<RelPath>>>,
     git_dir_scan_id: usize,
     /// Absolute path to the original .git entry that caused us to create this repository.
     ///
@@ -2599,6 +2628,12 @@ impl LocalSnapshot {
             .find(|entry| entry.work_directory.path_key() == PathKey(path.into()))
     }
 
+    fn is_path_tracked_or_parent_of_tracked(&self, path: &RelPath) -> bool {
+        self.git_repositories
+            .iter()
+            .any(|(_, entry)| entry.tracked_path_overrides.contains(path))
+    }
+
     fn build_update(
         &self,
         project_id: u64,
@@ -3146,6 +3181,11 @@ impl BackgroundScannerState {
 
         let (repository_dir_abs_path, common_dir_abs_path) =
             discover_git_paths(&dot_git_abs_path, fs).await;
+        let tracked_path_overrides =
+            load_tracked_path_overrides(&work_directory, &dot_git_abs_path, fs)
+                .await
+                .log_err()
+                .unwrap_or_else(|| Arc::new(HashSet::default()));
         watcher
             .add(&common_dir_abs_path)
             .context("failed to add common directory to watcher")
@@ -3161,6 +3201,7 @@ impl BackgroundScannerState {
             work_directory_id,
             work_directory,
             work_directory_abs_path: work_directory_abs_path.as_path().into(),
+            tracked_path_overrides,
             git_dir_scan_id: 0,
             dot_git_abs_path,
             common_dir_abs_path,
@@ -3174,6 +3215,26 @@ impl BackgroundScannerState {
         log::trace!("inserting new local git repository");
         Ok(local_repository)
     }
+}
+
+async fn load_tracked_path_overrides(
+    work_directory: &WorkDirectory,
+    dot_git_abs_path: &Path,
+    fs: &dyn Fs,
+) -> Result<Arc<HashSet<Arc<RelPath>>>> {
+    let repository = fs.open_repo(dot_git_abs_path, Some(Path::new("git")))?;
+    let tracked_files = repository
+        .tracked_files(&work_directory.tracked_files_prefixes()?)
+        .await?;
+    let mut tracked_path_overrides = HashSet::default();
+    for tracked_file in tracked_files {
+        if let Some(worktree_path) = work_directory.worktree_path_for_repo_path(&tracked_file) {
+            for ancestor in worktree_path.ancestors() {
+                tracked_path_overrides.insert(Arc::from(ancestor));
+            }
+        }
+    }
+    Ok(Arc::new(tracked_path_overrides))
 }
 
 async fn is_git_dir(path: &Path, fs: &dyn Fs) -> bool {
@@ -4670,7 +4731,9 @@ impl BackgroundScanner {
             }
 
             if child_entry.is_dir() {
-                child_entry.is_ignored = ignore_stack.is_abs_path_ignored(&child_abs_path, true);
+                child_entry.is_ignored = self
+                    .is_path_ignored(&child_path, &child_abs_path, true, &ignore_stack)
+                    .await;
                 child_entry.is_always_included =
                     self.settings.is_path_always_included(&child_path, true);
 
@@ -4695,7 +4758,9 @@ impl BackgroundScanner {
                     }));
                 }
             } else {
-                child_entry.is_ignored = ignore_stack.is_abs_path_ignored(&child_abs_path, false);
+                child_entry.is_ignored = self
+                    .is_path_ignored(&child_path, &child_abs_path, false, &ignore_stack)
+                    .await;
                 child_entry.is_always_included =
                     self.settings.is_path_always_included(&child_path, false);
             }
@@ -4834,7 +4899,11 @@ impl BackgroundScanner {
                     );
 
                     let is_dir = fs_entry.is_dir();
-                    fs_entry.is_ignored = ignore_stack.is_abs_path_ignored(&abs_path, is_dir);
+                    fs_entry.is_ignored = if ignore_stack.is_abs_path_ignored(&abs_path, is_dir) {
+                        !state.snapshot.is_path_tracked_or_parent_of_tracked(path)
+                    } else {
+                        false
+                    };
                     fs_entry.is_external = is_external;
                     fs_entry.is_private = self.is_path_private(path);
                     fs_entry.is_always_included =
@@ -5121,7 +5190,11 @@ impl BackgroundScanner {
         for mut entry in snapshot.child_entries(&path).cloned() {
             let was_ignored = entry.is_ignored;
             let abs_path: Arc<Path> = snapshot.absolutize(&entry.path).into();
-            entry.is_ignored = ignore_stack.is_abs_path_ignored(&abs_path, entry.is_dir());
+            entry.is_ignored = if ignore_stack.is_abs_path_ignored(&abs_path, entry.is_dir()) {
+                !snapshot.is_path_tracked_or_parent_of_tracked(&entry.path)
+            } else {
+                false
+            };
 
             if entry.is_dir() {
                 let child_ignore_stack = if entry.is_ignored {
@@ -5224,10 +5297,22 @@ impl BackgroundScanner {
                         .await;
                 }
                 Some(local_repository) => {
+                    let tracked_path_overrides = load_tracked_path_overrides(
+                        &local_repository.work_directory,
+                        &local_repository.dot_git_abs_path,
+                        self.fs.as_ref(),
+                    )
+                    .await
+                    .log_err()
+                    .unwrap_or_else(|| Arc::new(HashSet::default()));
+                    if tracked_path_overrides != local_repository.tracked_path_overrides {
+                        affected_repo_roots.push(local_repository.work_directory_abs_path.clone());
+                    }
                     state.snapshot.git_repositories.update(
                         &local_repository.work_directory_id,
                         |entry| {
                             entry.git_dir_scan_id = scan_id;
+                            entry.tracked_path_overrides = tracked_path_overrides.clone();
                         },
                     );
                 }
@@ -5288,6 +5373,25 @@ impl BackgroundScanner {
 
     fn is_path_private(&self, path: &RelPath) -> bool {
         !self.share_private_files && self.settings.is_path_private(path)
+    }
+
+    async fn is_path_ignored(
+        &self,
+        path: &RelPath,
+        abs_path: &Path,
+        is_dir: bool,
+        ignore_stack: &IgnoreStack,
+    ) -> bool {
+        if !ignore_stack.is_abs_path_ignored(abs_path, is_dir) {
+            return false;
+        }
+
+        !self
+            .state
+            .lock()
+            .await
+            .snapshot
+            .is_path_tracked_or_parent_of_tracked(path)
     }
 
     async fn next_scan_request(&self) -> Result<ScanRequest> {

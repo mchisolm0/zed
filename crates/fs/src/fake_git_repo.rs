@@ -242,6 +242,28 @@ impl GitRepository for FakeGitRepository {
         async move { None }.boxed()
     }
 
+    fn tracked_files(&self, path_prefixes: &[RepoPath]) -> BoxFuture<'_, Result<Vec<RepoPath>>> {
+        let path_prefixes = path_prefixes.to_vec();
+        self.with_state_async(false, move |state| {
+            let mut tracked_paths = state
+                .head_contents
+                .keys()
+                .chain(state.index_contents.keys())
+                .filter(|path| {
+                    path_prefixes.is_empty()
+                        || path_prefixes
+                            .iter()
+                            .any(|path_prefix| path.starts_with(path_prefix))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            tracked_paths.sort_unstable();
+            tracked_paths.dedup();
+            Ok(tracked_paths)
+        })
+        .boxed()
+    }
+
     fn status(&self, path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>> {
         let workdir_path = self.dot_git_path.parent().unwrap();
 

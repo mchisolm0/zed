@@ -697,6 +697,7 @@ pub trait GitRepository: Send + Sync {
 
     fn merge_message(&self) -> BoxFuture<'_, Option<String>>;
 
+    fn tracked_files(&self, path_prefixes: &[RepoPath]) -> BoxFuture<'_, Result<Vec<RepoPath>>>;
     fn status(&self, path_prefixes: &[RepoPath]) -> Task<Result<GitStatus>>;
     fn diff_tree(&self, request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>>;
 
@@ -1519,6 +1520,33 @@ impl GitRepository for RealGitRepository {
                 anyhow::bail!("git status failed: {stderr}");
             }
         })
+    }
+
+    fn tracked_files(&self, path_prefixes: &[RepoPath]) -> BoxFuture<'_, Result<Vec<RepoPath>>> {
+        let repo = self.repository.clone();
+        let path_prefixes = path_prefixes.to_vec();
+        self.executor
+            .spawn(async move {
+                let mut index = repo.lock().index()?;
+                index.read(false)?;
+
+                let mut tracked_files = index
+                    .iter()
+                    .filter_map(|entry| {
+                        let path = std::str::from_utf8(&entry.path).log_err()?;
+                        let path = RepoPath::new(path).log_err()?;
+                        (path_prefixes.is_empty()
+                            || path_prefixes
+                                .iter()
+                                .any(|path_prefix| path.starts_with(path_prefix)))
+                        .then_some(path)
+                    })
+                    .collect::<Vec<_>>();
+                tracked_files.sort_unstable();
+                tracked_files.dedup();
+                Ok(tracked_files)
+            })
+            .boxed()
     }
 
     fn diff_tree(&self, request: DiffTreeType) -> BoxFuture<'_, Result<TreeDiff>> {
