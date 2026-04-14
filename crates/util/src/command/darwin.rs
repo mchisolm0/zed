@@ -589,6 +589,7 @@ fn set_close_on_exec(fd: libc::c_int) -> io::Result<()> {
 mod tests {
     use super::*;
     use futures_lite::AsyncWriteExt;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_spawn_echo() {
@@ -639,6 +640,27 @@ mod tests {
 
             assert!(output.status.success());
             assert_eq!(output.stderr, b"error\n");
+        });
+    }
+
+    #[test]
+    fn test_spawn_output_does_not_wait_for_execed_child_with_redirected_stdio() {
+        smol::block_on(async {
+            let started_at = Instant::now();
+
+            let output = Command::new("/bin/sh")
+                .args(["-c", "sleep 2 >/dev/null 2>&1 </dev/null & printf done"])
+                .output()
+                .await
+                .expect("failed to run command");
+
+            let elapsed = started_at.elapsed();
+            assert!(output.status.success());
+            assert_eq!(output.stdout, b"done");
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "output waited {elapsed:?} for a descendant that should not keep the pipes open",
+            );
         });
     }
 
