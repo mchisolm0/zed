@@ -7,8 +7,8 @@ use smol::Unblock;
 use std::collections::BTreeMap;
 use std::ffi::{CString, OsStr, OsString};
 use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::io::FromRawFd;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Output};
@@ -520,15 +520,40 @@ fn create_pipe() -> io::Result<(libc::c_int, libc::c_int)> {
     if result == -1 {
         return Err(io::Error::last_os_error());
     }
-    Ok((fds[0], fds[1]))
+
+    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    set_close_on_exec(read_fd.as_raw_fd())?;
+    set_close_on_exec(write_fd.as_raw_fd())?;
+
+    Ok((read_fd.into_raw_fd(), write_fd.into_raw_fd()))
 }
 
 fn open_dev_null(flags: libc::c_int) -> io::Result<libc::c_int> {
-    let fd = unsafe { libc::open(c"/dev/null".as_ptr() as *const libc::c_char, flags) };
+    let fd = unsafe {
+        libc::open(
+            c"/dev/null".as_ptr() as *const libc::c_char,
+            flags | libc::O_CLOEXEC,
+        )
+    };
     if fd == -1 {
         return Err(io::Error::last_os_error());
     }
     Ok(fd)
+}
+
+fn set_close_on_exec(fd: libc::c_int) -> io::Result<()> {
+    let previous_flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if previous_flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    let result = unsafe { libc::fcntl(fd, libc::F_SETFD, previous_flags | libc::FD_CLOEXEC) };
+    if result == -1 {
+        return Err(io::Error::last_os_error());
+    }
+
+    Ok(())
 }
 
 /// Zero means `Ok()`, all other values are treated as raw OS errors. Does not look at `errno`.
