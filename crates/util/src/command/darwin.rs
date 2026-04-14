@@ -552,6 +552,7 @@ fn invalid_input_error() -> io::Error {
 mod tests {
     use super::*;
     use futures_lite::AsyncWriteExt;
+    use std::os::unix::io::FromRawFd;
 
     #[test]
     fn test_spawn_echo() {
@@ -602,6 +603,73 @@ mod tests {
 
             assert!(output.status.success());
             assert_eq!(output.stderr, b"error\n");
+        });
+    }
+
+    #[test]
+    fn test_create_pipe_does_not_leak_write_end_across_exec() {
+        smol::block_on(async {
+            use std::time::Duration;
+
+            let (read_fd, write_fd) = create_pipe().expect("failed to create pipe");
+
+            let child_pid = unsafe { libc::fork() };
+            if child_pid == -1 {
+                panic!("failed to fork: {}", io::Error::last_os_error());
+            }
+
+            if child_pid == 0 {
+                unsafe {
+                    libc::execl(
+                        c"/bin/sleep".as_ptr(),
+                        c"sleep".as_ptr(),
+                        c"2".as_ptr(),
+                        std::ptr::null::<libc::c_char>(),
+                    );
+                    libc::_exit(127);
+                }
+            }
+
+            if unsafe { libc::close(write_fd) } == -1 {
+                panic!(
+                    "failed to close parent write end: {}",
+                    io::Error::last_os_error()
+                );
+            }
+
+            let mut read_end = Unblock::new(unsafe { std::fs::File::from_raw_fd(read_fd) });
+            let read_result = smol::future::or(
+                async {
+                    use futures_lite::AsyncReadExt;
+
+                    let mut data = Vec::new();
+                    read_end.read_to_end(&mut data).await?;
+                    io::Result::Ok(data)
+                },
+                async {
+                    smol::Timer::after(Duration::from_secs(1)).await;
+                    Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "pipe read timed out waiting for leaked write end to close",
+                    ))
+                },
+            )
+            .await;
+
+            if unsafe { libc::kill(child_pid, libc::SIGKILL) } == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    panic!("failed to kill child process: {error}");
+                }
+            }
+
+            let mut status: libc::c_int = 0;
+            if unsafe { libc::waitpid(child_pid, &mut status, 0) } == -1 {
+                panic!("failed to wait for child process: {}", io::Error::last_os_error());
+            }
+
+            let data = read_result.expect("failed to read pipe");
+            assert!(data.is_empty());
         });
     }
 
